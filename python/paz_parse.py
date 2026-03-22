@@ -64,9 +64,7 @@ def parse_pamt(pamt_path: str, paz_dir: str = None) -> list[PazEntry]:
     pamt_stem = os.path.splitext(os.path.basename(pamt_path))[0]
 
     off = 0
-    magic = struct.unpack_from('<I', data, off)[0]; off += 4
-    if magic != 0x09F510ED:
-        raise ValueError(f"Bad PAMT magic: 0x{magic:08X}")
+    off += 4  # skip magic (varies between game versions)
 
     paz_count = struct.unpack_from('<I', data, off)[0]; off += 4
     off += 8  # hash + zero
