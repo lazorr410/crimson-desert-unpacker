@@ -194,19 +194,25 @@ def _find_xml_comments(data: bytes) -> list[tuple[int, int]]:
 
 
 def _make_xml_safe_incompressible(length: int) -> bytes:
-    """Generate incompressible content that is safe inside an XML comment.
+    """Generate incompressible content safe inside an XML comment.
 
-    Uses base64-encoded random bytes: all printable ASCII, no control
-    characters, no '-->' sequences, and the randomness makes it
-    incompressible by LZ4.
+    Uses printable ASCII bytes excluding XML-special chars and '--' pairs.
+    Valid UTF-8, valid XML comment content, and varied enough (88 distinct
+    values) to be highly incompressible under LZ4.
     """
-    import os
-    import base64
-    # base64 expands by ~4/3, so generate enough raw bytes
-    raw = os.urandom(length)
-    b64 = base64.b64encode(raw)
-    # Trim to exact length (b64 is always >= length since we over-generated)
-    return b64[:length]
+    # Printable ASCII (0x20-0x7E) minus XML-special: < > & and -
+    # 0x20=space 0x2D='-' 0x3C='<' 0x3E='>' 0x26='&'
+    _ALPHABET = bytes(
+        c for c in range(0x20, 0x7F)
+        if c not in (0x2D, 0x3C, 0x3E, 0x26)
+    )  # 88 distinct values
+    rand = os.urandom(length)
+    return bytes(_ALPHABET[b % len(_ALPHABET)] for b in rand)
+
+
+def _find_insertion_points(data: bytes) -> list[int]:
+    """Return byte offsets of newlines in data — good places to insert comments."""
+    return [i for i, b in enumerate(data) if b == 0x0A]
 
 
 def _inflate_with_comments(padded: bytes, plaintext_len: int,
@@ -214,18 +220,17 @@ def _inflate_with_comments(padded: bytes, plaintext_len: int,
                            target_orig_size: int) -> bytes | None:
     """Inflate compressed size to exactly target_comp_size.
 
-    Three strategies, tried in order:
+    Strategies tried in order:
 
-    1. Replace zero bytes in the trailing padding with spaces. Works well
-       for small deltas when there is padding room.
+    1. Replace zero bytes in the trailing padding with spaces (small deltas).
 
-    2. Insert an XML comment with incompressible content into the trailing
-       padding. Binary-search the body length. Works for larger deltas
-       when there is padding room.
+    2. Insert a single XML comment with incompressible content into the
+       trailing padding. Binary-search body length.
 
-    3. Replace existing XML comment body bytes with incompressible content
-       in-place (same byte count). Works when plaintext fills orig_size
-       completely and there is no padding room at all.
+    3. Distribute incompressible XML comments across multiple newline
+       positions in the file body. Each comment is <!--BODY--> inserted
+       after a newline. Binary-search total body bytes across N slots.
+       This handles large deltas even when padding room is small.
 
     Returns adjusted plaintext (exactly target_orig_size bytes) or None.
     """
@@ -264,7 +269,7 @@ def _inflate_with_comments(padded: bytes, plaintext_len: int,
                 if len(lz4.block.compress(trial, store_size=False)) == target_comp_size:
                     return trial
 
-    # ── Strategy 2: XML comment with incompressible content ────────────
+    # ── Strategy 2: single XML comment in trailing padding ─────────────
     if padding_available >= 8:
         max_body = padding_available - 7  # 7 = len("<!---->")
         rand_body = _make_xml_safe_incompressible(max_body)
@@ -298,12 +303,104 @@ def _inflate_with_comments(padded: bytes, plaintext_len: int,
                 if len(lz4.block.compress(trial, store_size=False)) == target_comp_size:
                     return trial
 
+    # ── Strategy 3: distribute comments across newline positions ───────
+    # Insert incompressible XML comments at newline positions throughout
+    # the file body. Each inserted byte displaces one byte of content off
+    # the tail (which gets trimmed to stay within orig_size).
+    #
+    # Budget = padding_available + trailing_whitespace_in_plaintext.
+    # Trailing whitespace (spaces/tabs/CR/LF at end of file) can be trimmed
+    # safely — the game's XML parser ignores trailing whitespace.
+    #
+    # We try multiple slot counts (more slots = more overhead = higher c_max)
+    # until we find one that brackets the target.
+    plaintext = padded[:plaintext_len]
+    tail_ws = 0
+    for b in reversed(plaintext):
+        if b in (0x20, 0x09, 0x0D, 0x0A):
+            tail_ws += 1
+        else:
+            break
+    effective_budget = padding_available + tail_ws
+    base_content = bytes(plaintext[:plaintext_len - tail_ws])
+
+    newlines = _find_insertion_points(plaintext)
+    if newlines and effective_budget >= 7:
+        # Try increasing slot counts until the target is bracketed.
+        # Generate rand_pool once per slot-count attempt and reuse it
+        # consistently so c_min/c_max/binary-search all use the same bytes.
+        # Retry with fresh random bytes if the bracket check fails (c_max
+        # varies slightly with different random content).
+        for n_slots_try in [50, 100, 200, min(500, len(newlines))]:
+            n_slots_try = min(n_slots_try, len(newlines))
+            step = max(1, len(newlines) // n_slots_try)
+            slots = newlines[::step][:n_slots_try]
+
+            max_slots_usable = min(len(slots), effective_budget // 7)
+            if max_slots_usable < 1:
+                continue
+            max_total_body = effective_budget - max_slots_usable * 7
+            if max_total_body <= 0:
+                continue
+
+            for _attempt in range(8):  # retry with fresh random bytes
+                # Generate once and capture in closure — all calls use same pool
+                _rand_pool = _make_xml_safe_incompressible(
+                    max_total_body + max_slots_usable * 7 + 8)
+                _slots_cap = slots
+                _msu_cap = max_slots_usable
+                _bc_cap = base_content
+
+                def _build_multi_comment_trial(total_body: int,
+                                               _s=_slots_cap, _msu=_msu_cap,
+                                               _rp=_rand_pool, _bc=_bc_cap) -> bytes:
+                    n_active = _msu
+                    per_slot = total_body // n_active
+                    remainder = total_body % n_active
+                    insertions = []
+                    pool_offset = 0
+                    for slot_idx in range(n_active):
+                        body_len = per_slot + (1 if slot_idx < remainder else 0)
+                        body = _rp[pool_offset:pool_offset + body_len]
+                        pool_offset += body_len
+                        comment = b'<!--' + body + b'-->'
+                        insertions.append((_s[slot_idx], comment))
+                    result = bytearray(_bc)
+                    for ins_offset, comment in sorted(insertions, key=lambda x: -x[0]):
+                        result[ins_offset + 1:ins_offset + 1] = comment
+                    if len(result) > target_orig_size:
+                        result = result[:target_orig_size]
+                    else:
+                        result.extend(b'\x00' * (target_orig_size - len(result)))
+                    return bytes(result)
+
+                c_min = len(lz4.block.compress(_build_multi_comment_trial(0), store_size=False))
+                c_max = len(lz4.block.compress(_build_multi_comment_trial(max_total_body), store_size=False))
+                if not (c_min <= target_comp_size <= c_max):
+                    continue
+
+                lo, hi = 0, max_total_body
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    trial = _build_multi_comment_trial(mid)
+                    c = len(lz4.block.compress(trial, store_size=False))
+                    if c == target_comp_size:
+                        return trial
+                    elif c < target_comp_size:
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                for n in range(max(0, lo - 30), min(lo + 30, max_total_body + 1)):
+                    trial = _build_multi_comment_trial(n)
+                    if len(lz4.block.compress(trial, store_size=False)) == target_comp_size:
+                        return trial
+
     return None
 
 
 def _inflate_by_replacing_comment_bodies(padded: bytes, target_comp_size: int) -> bytes | None:
-    """Strategy 3: replace existing XML comment body bytes with incompressible
-    content in-place (same byte count, no size change).
+    """Replace existing XML comment body bytes with incompressible content
+    in-place (same byte count, no size change).
 
     Tries multiple random fills — each gives a different compressed-size curve,
     so retrying finds one where the target is reachable.
@@ -358,6 +455,95 @@ def _inflate_by_replacing_comment_bodies(padded: bytes, target_comp_size: int) -
     return None
 
 
+def _inflate_by_replacing_whitespace_runs(padded: bytes, target_comp_size: int) -> bytes | None:
+    """Replace whitespace-only runs with XML comments containing incompressible
+    content, in-place (same byte count, no size change).
+
+    Finds runs of 8+ consecutive whitespace bytes (indentation/blank lines in
+    formatted XML). Replaces each run with <!--BODY--> padded back to the same
+    length with spaces. The random body bytes are incompressible, breaking LZ4
+    back-references and inflating the compressed size.
+
+    Only runs of 8+ bytes are used (minimum for a valid <!--X--> comment).
+    The surrounding XML structure is preserved — the comment replaces whitespace
+    that the game's XML parser ignores anyway.
+
+    Returns adjusted data or None.
+    """
+    # Find whitespace-only runs of 8+ bytes (space, tab, CR, LF)
+    runs = []  # list of (start, end) for each qualifying run
+    i = 0
+    data = padded
+    n = len(data)
+    while i < n:
+        if data[i] in (0x20, 0x09, 0x0D, 0x0A):
+            run_start = i
+            while i < n and data[i] in (0x20, 0x09, 0x0D, 0x0A):
+                i += 1
+            run_len = i - run_start
+            if run_len >= 8:
+                runs.append((run_start, i))
+        else:
+            i += 1
+
+    if not runs:
+        return None
+
+    # For each run we can embed a comment <!--BODY--> where body fills
+    # (run_len - 7) bytes, padded back with spaces to run_len.
+    # We treat each run as a slot: either fully activated (max body) or
+    # not activated (original whitespace). Binary-search how many slots
+    # to activate to hit the target compressed size.
+    total_slots = len(runs)
+
+    def _build_trial_with_slots(n_active: int, rand_fill: bytes) -> bytes:
+        trial = bytearray(padded)
+        fill_offset = 0
+        for run_start, run_end in runs[:n_active]:
+            run_len = run_end - run_start
+            body_len = run_len - 7  # 4 (<!--) + body + 3 (-->)
+            body = rand_fill[fill_offset:fill_offset + body_len]
+            fill_offset += body_len
+            comment = b'<!--' + body + b'-->'
+            # Pad back to run_len with spaces
+            replacement = comment + b' ' * (run_len - len(comment))
+            trial[run_start:run_end] = replacement
+        return bytes(trial)
+
+    total_body = sum(max(0, (e - s) - 7) for s, e in runs)
+
+    def _try_fill(rand_fill: bytes) -> bytes | None:
+        c_none = len(lz4.block.compress(_build_trial_with_slots(0, rand_fill), store_size=False))
+        c_all  = len(lz4.block.compress(_build_trial_with_slots(total_slots, rand_fill), store_size=False))
+        if target_comp_size < c_none or target_comp_size > c_all:
+            return None
+
+        lo, hi = 0, total_slots
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            c = len(lz4.block.compress(_build_trial_with_slots(mid, rand_fill), store_size=False))
+            if c == target_comp_size:
+                return _build_trial_with_slots(mid, rand_fill)
+            elif c < target_comp_size:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        for n in range(max(0, lo - 10), min(lo + 10, total_slots + 1)):
+            trial = _build_trial_with_slots(n, rand_fill)
+            if len(lz4.block.compress(trial, store_size=False)) == target_comp_size:
+                return trial
+
+        return None
+
+    for _ in range(12):
+        result = _try_fill(_make_xml_safe_incompressible(total_body + 16))
+        if result is not None:
+            return result
+
+    return None
+
+
 def _match_compressed_size(plaintext: bytes, target_comp_size: int,
                            target_orig_size: int) -> bytes:
     """Adjust plaintext so it compresses to exactly target_comp_size.
@@ -374,6 +560,15 @@ def _match_compressed_size(plaintext: bytes, target_comp_size: int,
         ValueError if size matching fails
     """
     if len(plaintext) > target_orig_size:
+        excess = len(plaintext) - target_orig_size
+        comments = _find_xml_comments(plaintext)
+        comment_room = sum(max(0, end - start - 1) for start, end in comments)
+        if comment_room < excess:
+            raise ValueError(
+                f"Modified file is {excess} bytes over orig_size ({target_orig_size}) "
+                f"with only {comment_room} bytes of XML comment content available to trim. "
+                f"You need to shorten your changes by {excess - comment_room} bytes "
+                f"(e.g. remove added attributes or shorten values).")
         padded = _shrink_to_orig_size(plaintext, target_orig_size)
     else:
         padded = _pad_to_orig_size(plaintext, target_orig_size)
@@ -395,82 +590,75 @@ def _match_compressed_size(plaintext: bytes, target_comp_size: int,
         result = _inflate_by_replacing_comment_bodies(padded, target_comp_size)
         if result is not None:
             return result
+        # Last resort: replace whitespace runs with incompressible content
+        result = _inflate_by_replacing_whitespace_runs(padded, target_comp_size)
+        if result is not None:
+            return result
         raise ValueError(
             f"Cannot match target comp_size {target_comp_size} "
             f"(got {len(comp)}, delta {delta}). "
-            f"File compresses too well — not enough padding room to inflate. "
-            f"Try making fewer or smaller changes to the XML.")
+            f"File compresses too well — need ~{-delta} more bytes of incompressible content. "
+            f"Try making fewer changes, or add more content to bring the file closer to orig_size ({target_orig_size} bytes).")
 
     # Need to SHRINK: compressed output is too large.
-    # Replace bytes with spaces to make content more compressible.
+    # Strategy: replace non-space bytes in the padded data with spaces.
+    # Spaces are maximally compressible in LZ4 (back-references to prior runs).
+    #
+    # We build a sorted list of candidate positions — bytes that are currently
+    # not spaces, prioritised by proximity to existing space runs (so each
+    # replacement is most likely to extend a back-reference and reduce size).
+    # Then we do a cumulative scan: replace 1, 2, 3 … positions and stop as
+    # soon as compressed size hits the target.
+    #
+    # We do NOT binary-search because LZ4 compression is not strictly monotonic
+    # byte-by-byte — a single replacement can sometimes increase size slightly
+    # before the next one decreases it. A linear scan is the only safe approach.
 
-    # Collect candidate positions: comment bytes first, then all non-space bytes
-    comments = _find_xml_comments(padded)
-    comment_positions = set()
-    for cstart, cend in comments:
-        for i in range(cstart, cend):
-            if padded[i:i+1] != b' ':
-                comment_positions.add(i)
-
-    # Try comment positions first (safest), then scan all positions
-    candidates = sorted(comment_positions)
-    candidates_set = set(candidates)
-
-    # Phase 1: single-byte replacements in comments
-    for i in candidates:
-        trial = bytearray(padded)
-        trial[i] = 0x20
-        c = lz4.block.compress(bytes(trial), store_size=False)
-        if len(c) == target_comp_size:
-            return bytes(trial)
-
-    # Phase 2: single-byte replacements across the whole file
-    # Sample positions evenly to avoid scanning all 290k bytes
-    step = max(1, len(padded) // 5000)
-    for i in range(0, len(padded), step):
-        if padded[i:i+1] == b' ' or i in candidates_set:
-            continue
-        trial = bytearray(padded)
-        trial[i] = 0x20
-        c = lz4.block.compress(bytes(trial), store_size=False)
-        if len(c) == target_comp_size:
-            return bytes(trial)
-
-    # Phase 3: full scan if sampling missed
+    # Build candidate list: non-space bytes, ordered by proximity to spaces
+    # (positions immediately adjacent to a space first, then the rest).
+    space_set = set(i for i in range(len(padded)) if padded[i] == 0x20)
+    adjacent = []
+    non_adjacent = []
     for i in range(len(padded)):
-        if padded[i:i+1] == b' ' or i in candidates_set:
+        if padded[i] == 0x20:
             continue
-        trial = bytearray(padded)
-        trial[i] = 0x20
-        c = lz4.block.compress(bytes(trial), store_size=False)
-        if len(c) == target_comp_size:
+        if (i > 0 and padded[i - 1] == 0x20) or (i + 1 < len(padded) and padded[i + 1] == 0x20):
+            adjacent.append(i)
+        else:
+            non_adjacent.append(i)
+    candidates = adjacent + non_adjacent
+
+    if not candidates:
+        raise ValueError(
+            f"Cannot match target comp_size {target_comp_size} "
+            f"(got {len(comp)}, delta {delta}): no replaceable bytes")
+
+    # Cumulative replacement scan — apply replacements one at a time and check
+    trial = bytearray(padded)
+    for n, pos in enumerate(candidates):
+        trial[pos] = 0x20
+        c = len(lz4.block.compress(bytes(trial), store_size=False))
+        if c == target_comp_size:
             return bytes(trial)
+        if c < target_comp_size:
+            # Overshot — the previous state was closest; do a local scan
+            # around the last few replacements to find the exact target
+            break
+    else:
+        raise ValueError(
+            f"Cannot match target comp_size {target_comp_size} "
+            f"(got {len(comp)}, delta {delta}): exhausted all candidates")
 
-    # Phase 4: try multi-byte replacements for larger deltas
-    if delta > 1:
-        # Binary search over number of comment bytes to replace
-        lo, hi = 0, len(candidates)
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            trial = bytearray(padded)
-            for idx in candidates[:mid]:
-                trial[idx] = 0x20
-            c = lz4.block.compress(bytes(trial), store_size=False)
-            if len(c) == target_comp_size:
-                return bytes(trial)
-            elif len(c) > target_comp_size:
-                lo = mid + 1
-            else:
-                hi = mid - 1
-
-        # Linear scan near boundary
-        for n in range(max(0, lo - 20), min(lo + 20, len(candidates) + 1)):
-            trial = bytearray(padded)
-            for idx in candidates[:n]:
-                trial[idx] = 0x20
-            c = lz4.block.compress(bytes(trial), store_size=False)
-            if len(c) == target_comp_size:
-                return bytes(trial)
+    # We overshot at position n. Try reverting the last few replacements
+    # one at a time to find the exact target.
+    for revert_count in range(1, min(n + 2, 200)):
+        # Revert the last `revert_count` replacements
+        trial2 = bytearray(padded)
+        for pos in candidates[:n + 1 - revert_count]:
+            trial2[pos] = 0x20
+        c = len(lz4.block.compress(bytes(trial2), store_size=False))
+        if c == target_comp_size:
+            return bytes(trial2)
 
     raise ValueError(
         f"Cannot match target comp_size {target_comp_size} "
